@@ -7,3 +7,4 @@
 |https://blog.wohin.me/|https://blog.wohin.me/posts/tombkeeper-sec-learning/ 【tombkeeper关于信息安全学习的分享】|
 |https://lcx.cc/|lcx.cc 由 Nuclear’Atk (核攻击) 创建于 2010 年 04 月 30 日|
 |https://huaidan.org/list|鬼仔's Blog 经典文章存档|
+|http://www.vxjump.net/|纯粹的技术研究|
