@@ -1,5 +1,3 @@
-# learner
-***
 |博客地址|备注|
 |-|-|
 |https://github.com/Vancir|365-days-get-xuanwulab-job 【365天获取玄武实验室的工作】|
